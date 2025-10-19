@@ -1,160 +1,396 @@
-#!/bin/bash
-# ===========================================
-#   GERENCIADOR SSH AVANÇADO COM RELATÓRIOS E API
-#   Ubuntu 20.04 / 22.04 / 24.04
-# ===========================================
+#!/usr/bin/env bash
+# gerenciador_ssh_profissional.sh
+# Versão: 1.0
+# Descrição: Gerenciador SSH completo - gestão de usuários, segurança, monitoramento,
+#           instalação automática e relatórios. Feito para uso em servidores Debian/Ubuntu.
 
-LIMIT_FILE="/etc/ssh/ssh_limits.conf"
-LOG_FILE="/var/log/ssh_manager.log"
-touch "$LIMIT_FILE" "$LOG_FILE"
+# --- Configurações ---
+LOG_FILE="/var/log/gerenciador_ssh.log"
+REPO_URL="https://github.com/usuario/gerenciador_ssh.git" # Troque pelo seu repo
+SCRIPT_NAME="gerenciador_ssh_profissional.sh"
 
-menu() {
-  clear
-  echo "==========================================="
-  echo "      GERENCIADOR DE USUÁRIOS SSH"
-  echo "==========================================="
-  echo "1) Criar novo usuário"
-  echo "2) Remover usuário"
-  echo "3) Listar usuários ativos"
-  echo "4) Criar usuário temporário"
-  echo "5) Definir limite de conexões"
-  echo "6) Ver logins ativos"
-  echo "7) Gerar relatório diário"
-  echo "8) Iniciar API HTTP local"
-  echo "9) Sair"
-  echo "==========================================="
-  read -p "Escolha uma opção: " opcao
+set -euo pipefail
+IFS=$'\n\t'
 
-  case $opcao in
-    1) criar_usuario ;;
-    2) remover_usuario ;;
-    3) listar_usuarios ;;
-    4) criar_usuario_temporario ;;
-    5) limitar_conexoes ;;
-    6) ver_logins ;;
-    7) gerar_relatorio ;;
-    8) iniciar_api ;;
-    9) exit 0 ;;
-    *) echo "Opção inválida!"; sleep 1; menu ;;
+# --- Utils ---
+log() {
+  local msg="$(date +'%Y-%m-%d %H:%M:%S') - $*"
+  echo "$msg" | tee -a "$LOG_FILE"
+}
+
+require_root() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "Este script precisa ser executado como root." >&2
+    exit 1
+  fi
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+ensure_dependency() {
+  local dep="$1"
+  if ! command_exists "$dep"; then
+    log "Instalando dependência: $dep"
+    apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$dep" >/dev/null
+  fi
+}
+
+safe_read() {
+  # leitura segura sem expor variáveis em pipelines
+  local __resultvar=$1
+  shift
+  read -r "$__resultvar" "$@"
+}
+
+# --- Inicialização ---
+init() {
+  require_root
+  mkdir -p "$(dirname "$LOG_FILE")"
+  touch "$LOG_FILE"
+  chmod 600 "$LOG_FILE"
+  log "Inicializando $SCRIPT_NAME"
+  # instalar whiptail se não existir
+  ensure_dependency whiptail
+}
+
+# --- Funções de Usuário SSH ---
+ssh_user_create() {
+  local username="$1"
+  local pubkey_file="$2" # opcional
+
+  if id "$username" >/dev/null 2>&1; then
+    log "Usuário $username já existe"
+    return 1
+  fi
+
+  useradd -m -s /bin/bash "$username"
+  passwd -l "$username" >/dev/null 2>&1 || true
+  usermod -aG ssh "$username" || true
+
+  # configurar .ssh
+  local sshdir="/home/$username/.ssh"
+  mkdir -p "$sshdir"
+  chmod 700 "$sshdir"
+  touch "$sshdir/authorized_keys"
+  chmod 600 "$sshdir/authorized_keys"
+  chown -R "$username:$username" "$sshdir"
+
+  if [[ -n "$pubkey_file" && -f "$pubkey_file" ]]; then
+    cat "$pubkey_file" >> "$sshdir/authorized_keys"
+    chown "$username:$username" "$sshdir/authorized_keys"
+  fi
+
+  log "Criado usuário SSH: $username"
+}
+
+ssh_user_delete() {
+  local username="$1"
+  if ! id "$username" >/dev/null 2>&1; then
+    log "Usuário $username não existe"
+    return 1
+  fi
+  pkill -u "$username" || true
+  userdel -r "$username"
+  log "Deletado usuário: $username"
+}
+
+ssh_user_lock() {
+  local username="$1"
+  usermod -L "$username"
+  log "Bloqueado usuário: $username"
+}
+
+ssh_user_unlock() {
+  local username="$1"
+  usermod -U "$username"
+  log "Desbloqueado usuário: $username"
+}
+
+ssh_user_list() {
+  echo "Usuários com /home:" 
+  awk -F: '/\/home/ {print $1}' /etc/passwd
+}
+
+ssh_active_sessions() {
+  echo "Sessões ativas (who):"
+  who
+  echo
+  echo "sshd conexões (ss -tnp | grep sshd):"
+  ss -tnp | grep sshd || true
+}
+
+ssh_user_report() {
+  local username="$1"
+  if ! id "$username" >/dev/null 2>&1; then
+    echo "Usuário não encontrado"
+    return 1
+  fi
+  echo "Relatório para $username"
+  last -a | grep "^$username" || true
+  ps -u "$username" -o pid,cmd || true
+  du -sh /home/$username 2>/dev/null || true
+}
+
+# --- Monitoramento do Sistema ---
+system_status() {
+  echo "Uptime: $(uptime -p)"
+  echo "Load: $(cat /proc/loadavg)"
+  echo "Memória:"
+  free -h
+  echo
+  echo "Disco:"
+  df -h
+  echo
+  echo "Top processos por CPU:"
+  ps aux --sort=-%cpu | head -n 10
+}
+
+# --- Segurança: instalar e configurar ---
+setup_basic_security() {
+  log "Configurando segurança básica (openssh-server, fail2ban, ufw)"
+  apt-get update -y
+  DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server fail2ban ufw >/dev/null
+
+  # exemplo de configuração mínima do UFW
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw allow OpenSSH
+  ufw --force enable
+
+  # Fail2ban configuração básica
+  if [[ -f /etc/fail2ban/jail.local ]]; then
+    log "Fail2ban já tem jail.local"
+  else
+    cat >/etc/fail2ban/jail.local <<'EOF'
+[sshd]
+enabled = true
+port    = ssh
+logpath = %(sshd_log)s
+maxretry = 5
+bantime = 3600
+EOF
+  fi
+  systemctl restart fail2ban || true
+  systemctl enable fail2ban || true
+  log "Segurança básica configurada"
+}
+
+# --- Instalador / Atualizador (para usar no GitHub) ---
+install_from_repo() {
+  local target_dir="/opt/gerenciador_ssh"
+  mkdir -p "$target_dir"
+  if command_exists git; then
+    if [[ -d "$target_dir/.git" ]]; then
+      git -C "$target_dir" pull
+    else
+      git clone "$REPO_URL" "$target_dir"
+    fi
+    ln -sf "$target_dir/$SCRIPT_NAME" /usr/local/bin/gerenciador_ssh
+    chmod +x "$target_dir/$SCRIPT_NAME"
+    log "Instalado/atualizado a partir do repositório"
+  else
+    log "git não encontrado, instalando git..."
+    apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y git >/dev/null
+    install_from_repo
+  fi
+}
+
+# --- Relatórios ---
+generate_report() {
+  local outfile="/tmp/gerenciador_ssh_report_$(date +%Y%m%d_%H%M%S).txt"
+  {
+    echo "Relatório gerado: $(date)"
+    echo
+    echo "=== UPTIME & LOAD ==="
+    uptime
+    echo
+    echo "=== MEMÓRIA ==="
+    free -h
+    echo
+    echo "=== DISCO ==="
+    df -h
+    echo
+    echo "=== SESSÕES ATIVAS ==="
+    who
+    echo
+    echo "=== LOGINS RECENTES (last -n 50) ==="
+    last -n 50
+  } >"$outfile"
+  log "Relatório gerado: $outfile"
+  echo "$outfile"
+}
+
+# --- Interface com whiptail ---
+main_menu() {
+  while true; do
+    CHOICE=$(whiptail --title "Gerenciador SSH - Profissional" --menu "Escolha uma opção" 20 78 12 \
+      "1" "Usuários SSH: Criar/Listar/Bloquear/Excluir" \
+      "2" "Sessões ativas / Relatórios" \
+      "3" "Monitoramento do Sistema" \
+      "4" "Configurar segurança básica (openssh/fail2ban/ufw)" \
+      "5" "Instalar/Atualizar via GitHub" \
+      "6" "Gerar relatório" \
+      "7" "Sair" 3>&1 1>&2 2>&3)
+
+    exitstatus=$?
+    if [ $exitstatus -ne 0 ]; then
+      log "Usuário saiu do menu"
+      break
+    fi
+
+    case "$CHOICE" in
+      "1")
+        user_management_menu
+        ;;
+      "2")
+        ssh_active_sessions | less
+        ;;
+      "3")
+        system_status | less
+        ;;
+      "4")
+        setup_basic_security
+        whiptail --msgbox "Segurança básica configurada." 8 40
+        ;;
+      "5")
+        install_from_repo
+        whiptail --msgbox "Instalado/atualizado a partir do repositório." 8 40
+        ;;
+      "6")
+        local report
+        report=$(generate_report)
+        whiptail --msgbox "Relatório salvo em: $report" 8 60
+        ;;
+      "7")
+        log "Saindo"
+        break
+        ;;
+    esac
+  done
+}
+
+user_management_menu() {
+  while true; do
+    UMENU=$(whiptail --title "Usuários SSH" --menu "Escolha" 20 70 10 \
+      "1" "Criar usuário" \
+      "2" "Listar usuários" \
+      "3" "Bloquear usuário" \
+      "4" "Desbloquear usuário" \
+      "5" "Excluir usuário" \
+      "6" "Gerar relatório do usuário" \
+      "7" "Voltar" 3>&1 1>&2 2>&3)
+
+    rc=$?
+    if [ $rc -ne 0 ]; then
+      break
+    fi
+
+    case "$UMENU" in
+      "1")
+        username=$(whiptail --inputbox "Nome do usuário:" 8 40 3>&1 1>&2 2>&3)
+        pubkey=$(whiptail --inputbox "Caminho para chave pública (opcional):" 8 60 3>&1 1>&2 2>&3)
+        ssh_user_create "$username" "$pubkey"
+        whiptail --msgbox "Usuário $username criado (ou tente ver logs)." 8 60
+        ;;
+      "2")
+        users=$(ssh_user_list)
+        whiptail --msgbox "Usuarios:\n$users" 20 70
+        ;;
+      "3")
+        username=$(whiptail --inputbox "Nome do usuário para bloquear:" 8 40 3>&1 1>&2 2>&3)
+        ssh_user_lock "$username"
+        whiptail --msgbox "Usuário $username bloqueado." 8 40
+        ;;
+      "4")
+        username=$(whiptail --inputbox "Nome do usuário para desbloquear:" 8 40 3>&1 1>&2 2>&3)
+        ssh_user_unlock "$username"
+        whiptail --msgbox "Usuário $username desbloqueado." 8 40
+        ;;
+      "5")
+        username=$(whiptail --inputbox "Nome do usuário para excluir:" 8 40 3>&1 1>&2 2>&3)
+        if whiptail --yesno "Tem certeza que deseja excluir $username?" 8 60; then
+          ssh_user_delete "$username"
+          whiptail --msgbox "Usuário $username excluído." 8 40
+        fi
+        ;;
+      "6")
+        username=$(whiptail --inputbox "Nome do usuário para relatório:" 8 40 3>&1 1>&2 2>&3)
+        ssh_user_report "$username" | less
+        ;;
+      "7")
+        break
+        ;;
+    esac
+  done
+}
+
+# --- CLI simples (para uso sem whiptail) ---
+usage() {
+  cat <<EOF
+Gerenciador SSH - Uso:
+  $0 --install            # Instala dependências e configura segurança básica
+  $0 --create USER [PUBKEY]  # Cria usuário SSH
+  $0 --delete USER       # Deleta usuário
+  $0 --lock USER         # Bloqueia usuário
+  $0 --unlock USER       # Desbloqueia usuário
+  $0 --list              # Lista usuários com /home
+  $0 --status            # Status do sistema
+  $0 --report            # Gera relatório completo
+  $0 --menu              # Abre interface whiptail
+  $0 --install-repo      # Instala/atualiza a partir do repositório
+EOF
+}
+
+# --- Argumentos CLI ---
+main() {
+  init
+  if [[ $# -eq 0 ]]; then
+    main_menu
+    exit 0
+  fi
+
+  case "$1" in
+    --install)
+      setup_basic_security
+      ;;
+    --create)
+      ssh_user_create "$2" "${3-}"
+      ;;
+    --delete)
+      ssh_user_delete "$2"
+      ;;
+    --lock)
+      ssh_user_lock "$2"
+      ;;
+    --unlock)
+      ssh_user_unlock "$2"
+      ;;
+    --list)
+      ssh_user_list
+      ;;
+    --status)
+      system_status
+      ;;
+    --report)
+      generate_report
+      ;;
+    --menu)
+      main_menu
+      ;;
+    --install-repo)
+      install_from_repo
+      ;;
+    --help|-h)
+      usage
+      ;;
+    *)
+      usage
+      ;;
   esac
 }
 
-criar_usuario() {
-  read -p "Usuário: " user
-  read -s -p "Senha: " pass
-  echo
-  useradd -m -s /bin/bash "$user"
-  echo "$user:$pass" | chpasswd
-  echo "$(date '+%F %T') - Criado usuário $user" >> "$LOG_FILE"
-  echo "Usuário $user criado com sucesso!"
-  sleep 2
-  menu
-}
-
-remover_usuario() {
-  read -p "Usuário a remover: " user
-  userdel -r "$user" 2>/dev/null
-  sed -i "/^$user:/d" "$LIMIT_FILE"
-  echo "$(date '+%F %T') - Removido usuário $user" >> "$LOG_FILE"
-  echo "Usuário $user removido."
-  sleep 2
-  menu
-}
-
-listar_usuarios() {
-  echo "Usuários SSH ativos:"
-  awk -F: '$3 >= 1000 && $1 != "nobody" {print $1}' /etc/passwd
-  echo
-  read -p "Pressione Enter para voltar..."
-  menu
-}
-
-criar_usuario_temporario() {
-  read -p "Usuário: " user
-  read -s -p "Senha: " pass
-  echo
-  read -p "Duração da conta (em dias): " dias
-  useradd -m -s /bin/bash "$user"
-  echo "$user:$pass" | chpasswd
-  chage -E $(date -d "+$dias days" +"%Y-%m-%d") "$user"
-  echo "$(date '+%F %T') - Criado usuário temporário $user ($dias dias)" >> "$LOG_FILE"
-  echo "Usuário $user criado e expira em $dias dias!"
-  sleep 2
-  menu
-}
-
-limitar_conexoes() {
-  read -p "Usuário: " user
-  read -p "Limite de conexões simultâneas: " limite
-  if id "$user" &>/dev/null; then
-    sed -i "/^$user:/d" "$LIMIT_FILE"
-    echo "$user:$limite" >> "$LIMIT_FILE"
-    echo "$(date '+%F %T') - Limite de $limite conexões definido para $user" >> "$LOG_FILE"
-    echo "Limite definido: $user pode ter até $limite conexões."
-  else
-    echo "Usuário $user não encontrado."
-  fi
-  sleep 2
-  menu
-}
-
-ver_logins() {
-  echo "Logins SSH ativos:"
-  echo "-------------------------------------------"
-  ss -o state established '( dport = :ssh )' | awk '/ESTAB/ {print $6}' | cut -d':' -f1 | sort | uniq -c
-  echo "-------------------------------------------"
-  echo
-  read -p "Pressione Enter para voltar..."
-  menu
-}
-
-gerar_relatorio() {
-  echo "Gerando relatório diário..."
-  echo "==========================================="
-  echo "Relatório SSH - $(date)" > /root/relatorio_ssh.txt
-  echo "" >> /root/relatorio_ssh.txt
-  echo "Usuários ativos:" >> /root/relatorio_ssh.txt
-  awk -F: '$3 >= 1000 && $1 != "nobody" {print $1}' /etc/passwd >> /root/relatorio_ssh.txt
-  echo "" >> /root/relatorio_ssh.txt
-  echo "Logins ativos no momento:" >> /root/relatorio_ssh.txt
-  ss -o state established '( dport = :ssh )' | awk '/ESTAB/ {print $6}' | cut -d':' -f1 | sort | uniq -c >> /root/relatorio_ssh.txt
-  echo "" >> /root/relatorio_ssh.txt
-  echo "Últimas ações registradas:" >> /root/relatorio_ssh.txt
-  tail -n 10 "$LOG_FILE" >> /root/relatorio_ssh.txt
-  echo "Relatório salvo em /root/relatorio_ssh.txt"
-  sleep 2
-  menu
-}
-
-iniciar_api() {
-  echo "Iniciando API HTTP local na porta 8080..."
-  nohup python3 /usr/local/bin/api_ssh.py > /dev/null 2>&1 &
-  echo "API rodando em http://localhost:8080"
-  sleep 2
-  menu
-}
-
-# Criação do script auxiliar para limite de conexões
-cat << 'EOF' > /usr/local/bin/ssh_limit_check.sh
-#!/bin/bash
-LIMIT_FILE="/etc/ssh/ssh_limits.conf"
-user="$PAM_USER"
-
-if grep -q "^$user:" "$LIMIT_FILE"; then
-  limit=$(grep "^$user:" "$LIMIT_FILE" | cut -d':' -f2)
-  current=$(pgrep -u "$user" | wc -l)
-  if [ "$current" -gt "$limit" ]; then
-    echo "Usuário $user atingiu o limite de conexões ($limit)." >&2
-    exit 1
-  fi
-fi
-EOF
-
-chmod +x /usr/local/bin/ssh_limit_check.sh
-
-# Configurar PAM (se ainda não configurado)
-if ! grep -q "ssh_limit_check.sh" /etc/pam.d/sshd; then
-  echo 'session required pam_exec.so /usr/local/bin/ssh_limit_check.sh' | tee -a /etc/pam.d/sshd > /dev/null
-fi
-
-menu
+main "$@"
